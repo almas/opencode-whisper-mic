@@ -10,7 +10,15 @@ import { existsSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
 import { Plugin } from "@opencode/plugin"
-import { commandHint, startBridge, stripSilenceHallucinations, whisperCli, type BridgeHandle } from "./bridge"
+import {
+  commandHint,
+  listModels,
+  MODEL_DIRS,
+  startBridge,
+  stripSilenceHallucinations,
+  whisperCli,
+  type BridgeHandle,
+} from "./bridge"
 import { WhisperMicRpc, type Prefs } from "./rpc"
 
 const PREFS_KEY = "whisper-mic/prefs"
@@ -22,36 +30,54 @@ function defaultWhisperBin(): string {
   return existsSync(local) ? local : "whisper-cli"
 }
 
+const PREFERRED_MODEL = join(LOCAL, "share/whisper-models/ggml-large-v3-turbo.bin")
+
+/** The biggest installed model, on machines that do not have the preferred one. */
+async function defaultModel(): Promise<string> {
+  if (existsSync(PREFERRED_MODEL)) return PREFERRED_MODEL
+  const found = await listModels()
+  return found[0]?.path ?? PREFERRED_MODEL
+}
+
 const DEFAULT_PREFS: Prefs = {
   lang: "auto",
   threads: 8,
   whisperBin: defaultWhisperBin(),
-  model: join(LOCAL, "share/whisper-models/ggml-large-v3-turbo.bin"),
+  model: PREFERRED_MODEL,
   stripSilence: true,
 }
 
-function normalizePrefs(stored: Partial<Prefs> | undefined): Prefs {
-  if (!stored || typeof stored !== "object") return { ...DEFAULT_PREFS }
+function normalizePrefs(stored: Partial<Prefs> | undefined, fallback: Prefs): Prefs {
+  if (!stored || typeof stored !== "object") return { ...fallback }
   const threads = Number(stored.threads)
   return {
-    lang: typeof stored.lang === "string" && stored.lang ? stored.lang : DEFAULT_PREFS.lang,
-    threads: Number.isFinite(threads) ? Math.max(1, Math.min(64, Math.round(threads))) : DEFAULT_PREFS.threads,
-    whisperBin: typeof stored.whisperBin === "string" && stored.whisperBin ? stored.whisperBin : DEFAULT_PREFS.whisperBin,
-    model: typeof stored.model === "string" && stored.model ? stored.model : DEFAULT_PREFS.model,
+    lang: typeof stored.lang === "string" && stored.lang ? stored.lang : fallback.lang,
+    threads: Number.isFinite(threads) ? Math.max(1, Math.min(64, Math.round(threads))) : fallback.threads,
+    whisperBin: typeof stored.whisperBin === "string" && stored.whisperBin ? stored.whisperBin : fallback.whisperBin,
+    model: typeof stored.model === "string" && stored.model ? stored.model : fallback.model,
     stripSilence: stored.stripSilence !== false,
   }
 }
 
+/**
+ * A window reload re-runs setup() in the same server process. A bridge left
+ * behind would hold the fixed port — pushing the next one onto an ephemeral one
+ * the GUI has to rediscover — and keep transcribing with stale prefs, so this
+ * module hands out exactly one handle.
+ */
+let owned: BridgeHandle | undefined
+
 export default Plugin.define({
   id: "whisper-mic",
   async setup(ctx) {
-    let prefs: Prefs = { ...DEFAULT_PREFS }
+    const defaults: Prefs = { ...DEFAULT_PREFS, model: await defaultModel() }
+    let prefs: Prefs = { ...defaults }
     let bridge: BridgeHandle | undefined
     let bridgeError = ""
 
     try {
       const stored = (await ctx.storage.get(PREFS_KEY)) as Partial<Prefs> | undefined
-      prefs = normalizePrefs(stored)
+      prefs = normalizePrefs(stored, defaults)
     } catch {
       /* first run */
     }
@@ -64,8 +90,11 @@ export default Plugin.define({
       return prefs.stripSilence ? stripSilenceHallucinations(text) : text
     }
 
+    owned?.close()
+    owned = undefined
     try {
       bridge = await startBridge({ onTranscribe: transcribe })
+      owned = bridge
       console.info(`[whisper-mic] bridge listening on http://whisper-mic.localhost:${bridge.port}`)
     } catch (error) {
       bridgeError = error instanceof Error ? error.message : String(error)
@@ -78,11 +107,20 @@ export default Plugin.define({
         origin: bridge ? `http://whisper-mic.localhost:${bridge.port}` : "",
         ready: Boolean(bridge),
         ...(bridgeError ? { error: bridgeError } : {}),
-        command: commandHint(settings()),
+        command: commandHint(settings(), prefs.lang),
       }),
       prefs: async () => ({ ...prefs }),
+      models: async () => {
+        const models = await listModels()
+        return {
+          models,
+          configured: prefs.model,
+          configuredExists: existsSync(prefs.model),
+          dirs: MODEL_DIRS,
+        }
+      },
       setPrefs: async (raw) => {
-        prefs = normalizePrefs({ ...prefs, ...(raw ?? {}) })
+        prefs = normalizePrefs({ ...prefs, ...(raw ?? {}) }, defaults)
         try {
           await ctx.storage.set(PREFS_KEY, { ...prefs })
         } catch {
@@ -91,5 +129,12 @@ export default Plugin.define({
         return { ...prefs }
       },
     })
+
+    return () => {
+      if (!bridge || owned !== bridge) return
+      owned = undefined
+      bridge.close()
+      bridge = undefined
+    }
   },
 })

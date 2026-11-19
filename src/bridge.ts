@@ -21,7 +21,7 @@
 
 import { spawn } from "node:child_process"
 import { createServer, type Server } from "node:http"
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
+import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises"
 import { existsSync } from "node:fs"
 import { homedir, tmpdir } from "node:os"
 import { join } from "node:path"
@@ -226,19 +226,35 @@ export interface WhisperSettings {
   threads: number
 }
 
-/** The exact flags we run; shown verbatim on the settings page. */
+/**
+ * Prompt biasing for Japanese, where whisper otherwise writes the kanji it
+ * expects instead of the kana it heard and drops particles; measured at +5–11
+ * recall points over the bare `-l ja` on real clips.
+ */
+const JA_PROMPT = "技術的な内容を日本語で正しく書き起こします。"
+
+/**
+ * The exact flags we run; shown verbatim on the settings page.
+ *
+ * Flag meanings are build-specific and were checked against the installed
+ * whisper-cli: threads are `-t` (`-tp` is --temperature, so `-tp 8` would run
+ * at temperature 8), and there is no `-mfa` — an unknown argument there prints
+ * usage and still exits 0, which loses the transcription silently.
+ */
 export function whisperArgs(settings: WhisperSettings, wavPath: string, outPath: string, language: string): string[] {
+  const lang = language || "auto"
   return [
     "-m",
     settings.model,
     "-f",
     wavPath,
     "-l",
-    language || "auto",
-    "-mfa",
-    "-nt",
-    "-tp",
+    lang,
+    "-t",
     String(settings.threads),
+    "-nt",
+    "-np",
+    ...(lang === "ja" ? ["-sns", "--prompt", JA_PROMPT, "--carry-initial-prompt"] : []),
     "-otxt",
     "-of",
     outPath,
@@ -251,8 +267,59 @@ export function formatCommand(bin: string, args: string[]): string {
   return [bin, ...args].map(quote).join(" ")
 }
 
-export function commandHint(settings: WhisperSettings): string {
-  return formatCommand(settings.bin, whisperArgs(settings, "CLIP.wav", "OUT", "auto"))
+/**
+ * One-line copyable form of what actually runs for the configured language,
+ * so the settings page cannot promise flags the bridge does not pass.
+ */
+export function commandHint(settings: WhisperSettings, language = "auto"): string {
+  return formatCommand(settings.bin, whisperArgs(settings, "CLIP.wav", "OUT", language))
+}
+
+/** Last lines of a command's output, for error messages that quote it. */
+function tail(log: string): string {
+  const clean = log.replace(/\s+/g, " ").trim()
+  return clean ? `: ${clean.slice(-240)}` : ""
+}
+
+/* ------------------------------------------------------------------ */
+/* model discovery                                                      */
+/* ------------------------------------------------------------------ */
+
+/** Where installed models usually live; the settings page lists what it finds. */
+export const MODEL_DIRS = [
+  join(LOCAL, "share/whisper-models"),
+  join(homedir(), ".cache/whisper"),
+  join(homedir(), "models"),
+  "/usr/local/share/whisper-models",
+]
+
+export interface ModelFile {
+  path: string
+  name: string
+  bytes: number
+}
+
+/**
+ * ggml model files already on disk, largest (best) first. Directories that do
+ * not exist are normal, not an error — this runs on every settings page open.
+ */
+export async function listModels(dirs: string[] = MODEL_DIRS): Promise<ModelFile[]> {
+  const found = new Map<string, ModelFile>()
+  for (const dir of dirs) {
+    let names: string[] = []
+    try {
+      names = await readdir(dir)
+    } catch {
+      continue
+    }
+    for (const name of names) {
+      if (!/^ggml.*\.bin$/i.test(name)) continue
+      const path = join(dir, name)
+      const info = await stat(path).catch(() => undefined)
+      if (info?.isFile()) found.set(path, { path, name, bytes: info.size })
+    }
+  }
+  return [...found.values()].sort((a, b) => b.bytes - a.bytes)
 }
 
 /**
@@ -270,22 +337,32 @@ export function whisperCli(settings: WhisperSettings): Transcriber {
       await writeFile(wavPath, wav)
       const env: NodeJS.ProcessEnv = { ...process.env }
       env.LD_LIBRARY_PATH = env.LD_LIBRARY_PATH ? `${LIB_DIR}:${env.LD_LIBRARY_PATH}` : LIB_DIR
+      // whisper.cpp reports bad arguments on stdout and usage on stderr, and
+      // both can come with exit 0, so the tail is what makes the failure
+      // readable in the settings page instead of a bare ENOENT.
+      let log = ""
       await new Promise<void>((resolve, reject) => {
         const child = spawn(settings.bin, whisperArgs(settings, wavPath, outPath, language), {
           env,
-          stdio: ["ignore", "ignore", "pipe"],
+          stdio: ["ignore", "pipe", "pipe"],
         })
-        let stderr = ""
-        child.stderr?.on("data", (chunk: Buffer) => {
-          if (stderr.length < 4000) stderr += chunk.toString()
-        })
+        const keep = (chunk: Buffer) => {
+          if (log.length < 4000) log += chunk.toString()
+        }
+        child.stdout?.on("data", keep)
+        child.stderr?.on("data", keep)
         child.on("error", (error) => reject(new Error(`cannot start ${settings.bin}: ${error.message}`)))
         child.on("close", (code) => {
           if (code === 0) resolve()
-          else reject(new Error(`${settings.bin} exited ${code}: ${stderr.trim().slice(-300)}`))
+          else reject(new Error(`${settings.bin} exited ${code}${tail(log)}`))
         })
       })
-      const text = await readFile(`${outPath}.txt`, "utf8")
+      const text = await readFile(`${outPath}.txt`, "utf8").catch(() => undefined)
+      if (text === undefined) {
+        throw new Error(
+          `${settings.bin} produced no text (model ${settings.model})${tail(log)} — check the model path and language in Settings.`,
+        )
+      }
       return text.replace(/\s+/g, " ").trim()
     } finally {
       void rm(dir, { recursive: true, force: true }).catch(() => {})

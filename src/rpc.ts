@@ -33,6 +33,22 @@ export interface BridgeInfo {
   command: string
 }
 
+export interface ModelOption {
+  /** Absolute path — this is also the value stored in `Prefs.model`. */
+  path: string
+  name: string
+  bytes: number
+}
+
+/** What the model picker shows: installed models plus the state of the saved one. */
+export interface ModelList {
+  models: ModelOption[]
+  configured: string
+  configuredExists: boolean
+  /** Directories the scan looked in, so the page can say where to put models. */
+  dirs: string[]
+}
+
 export const WhisperMicRpc = {
   id: "whisper-mic",
   methods: {
@@ -64,6 +80,31 @@ export const WhisperMicRpc = {
           stripSilence: { type: "boolean" },
         },
         required: ["lang", "threads", "whisperBin", "model", "stripSilence"],
+      },
+    },
+    // Models already on disk, for the settings picker.
+    models: {
+      input: { type: "object", properties: {} },
+      output: {
+        type: "object",
+        properties: {
+          models: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                path: { type: "string" },
+                name: { type: "string" },
+                bytes: { type: "number" },
+              },
+              required: ["path", "name", "bytes"],
+            },
+          },
+          configured: { type: "string" },
+          configuredExists: { type: "boolean" },
+          dirs: { type: "array", items: { type: "string" } },
+        },
+        required: ["models", "configured", "configuredExists", "dirs"],
       },
     },
     setPrefs: {

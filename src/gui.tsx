@@ -8,12 +8,13 @@
  * composer's send button, the header mic, or the palette command; a quick tap
  * starts hands-free mode, a second press ends the take.
  */
-import { Show, createEffect, createSignal, onCleanup, onMount, type JSX } from "solid-js"
+import { For, Show, createEffect, createSignal, onCleanup, onMount, type JSX } from "solid-js"
 import { Portal } from "solid-js/web"
 import { Command, Plugin, SettingsPage, Slot, type MountedSession } from "@opencode/plugin/gui"
-import { WhisperMicRpc, type BridgeInfo, type Prefs } from "./rpc"
+import { WhisperMicRpc, type BridgeInfo, type ModelList, type Prefs } from "./rpc"
 import {
   TAP_MAX_MS,
+  createOverlapWindower,
   encodeWavFromBlob,
   looksLikeAck,
   mergeTranscription,
@@ -40,8 +41,14 @@ interface HeaderProps {
 interface RpcLike {
   bridge(input?: object): Promise<unknown>
   prefs(input?: object): Promise<unknown>
+  models(input?: object): Promise<unknown>
   setPrefs(input: Partial<Prefs>): Promise<unknown>
 }
+
+/** Select value for a model path the scan did not find, so it stays editable. */
+const CUSTOM_MODEL = "custom"
+
+const formatSize = (bytes: number) => `${Math.max(1, Math.round(bytes / (1024 * 1024)))} MB`
 
 const DEFAULT_PREFS: Prefs = {
   lang: "auto",
@@ -112,6 +119,13 @@ export default Plugin.define({
       "whisper-mic.settings.threads": "Threads",
       "whisper-mic.settings.bin": "whisper-cli path",
       "whisper-mic.settings.model": "Model file",
+      "whisper-mic.settings.model.custom": "Other path…",
+      "whisper-mic.settings.model.none": "No ggml model found on this machine",
+      "whisper-mic.settings.model.missing": "That file is not there — transcription will fail until a model that exists is selected.",
+      "whisper-mic.settings.model.rescan": "Rescan",
+      "whisper-mic.settings.model.searched": "Looked in",
+      "whisper-mic.settings.model.speed": "Bigger models transcribe better and slower.",
+      "whisper-mic.test.silent": "whisper returned no text — nothing was picked up, or the model failed.",
       "whisper-mic.settings.strip": "Drop silence hallucinations (「ご視聴ありがとうございました」 etc.)",
       "whisper-mic.settings.bridge": "Bridge",
       "whisper-mic.settings.bridge.ready": "listening on",
@@ -147,6 +161,13 @@ export default Plugin.define({
       "whisper-mic.settings.threads": "スレッド数",
       "whisper-mic.settings.bin": "whisper-cliパス",
       "whisper-mic.settings.model": "モデルファイル",
+      "whisper-mic.settings.model.custom": "その他のパス…",
+      "whisper-mic.settings.model.none": "このマシンにggmlモデルが見当たりません",
+      "whisper-mic.settings.model.missing": "ファイルが存在しません — 存在するモデルを選ぶまで文字起こしは失敗します。",
+      "whisper-mic.settings.model.rescan": "再検索",
+      "whisper-mic.settings.model.searched": "検索先",
+      "whisper-mic.settings.model.speed": "モデルは大きいほど精度が上がりますが遅くなります。",
+      "whisper-mic.test.silent": "whisperはテキストを返しませんでした — 音声が拾えていないか、モデルが失敗しています。",
       "whisper-mic.settings.strip": "無音の幻覚表現（「ご視聴ありがとうございました」等）を除去",
       "whisper-mic.settings.bridge": "ブリッジ",
       "whisper-mic.settings.bridge.ready": "待受中:",
@@ -172,6 +193,16 @@ export default Plugin.define({
     }
     void refreshBridge()
 
+    // Only the settings page shows this, but fetching at mount means the picker
+    // is already filled when it opens, and a plain path box is the fallback if
+    // the server half is too old to answer.
+    const [modelList, setModelList] = createSignal<ModelList>()
+    const refreshModels = async () => {
+      const value = await retryRpc("models", () => rpc.models({}), 3)
+      if (value) setModelList(value as ModelList)
+    }
+    void refreshModels()
+
     const savePrefs = async (patch: Partial<Prefs>) => {
       const next = { ...prefs(), ...patch }
       setPrefs(next)
@@ -193,6 +224,8 @@ export default Plugin.define({
     let startedAt = 0
     /** Whisper replies for short filler clips; keep them until a real reply confirms them. */
     let heldFragment = ""
+    /** Overlaps each clip with the previous one; replaced at the start of every take. */
+    let windower = createOverlapWindower()
 
     // Uploads are strictly serialized: the merge rule needs results in order.
     let uploadChain: Promise<void> = Promise.resolve()
@@ -234,9 +267,10 @@ export default Plugin.define({
       uploadChain = uploadChain
         .then(async () => {
           try {
-            // Decode+resample inside the chain: whisper replies must merge in
-            // recording order, and the resample is CPU work worth serialising.
-            absorb(await transcribeClip(await encodeWavFromBlob(blob)))
+            // Decode, overlap and resample inside the chain: whisper replies
+            // must merge in recording order, and the resample is CPU work
+            // worth serialising.
+            absorb(await transcribeClip(await windower.push(blob)))
           } catch (error) {
             console.error(`[whisper-mic] clip failed: ${errorText(error)}`)
           } finally {
@@ -285,6 +319,7 @@ export default Plugin.define({
       setPending(0)
       setElapsed(0)
       heldFragment = ""
+      windower = createOverlapWindower()
     }
 
     const start = async () => {
@@ -355,12 +390,14 @@ export default Plugin.define({
 
     // ---------- palette command ----------
     ctx.add(Command, {
-      id: "record",
+      id: "whisper-mic.record",
       get title() {
         return ctx.t("whisper-mic.action.start")
       },
       keywords: "whisper mic dictation stt microphone stream",
-      bind: "mod+shift+m",
+      // voice-input already owns mod+shift+m; sharing it would start both
+      // recorders on one keypress, so each plugin gets its own key.
+      bind: "mod+shift+d",
       section: "prompt",
       run: () => toggle(),
     })
@@ -423,6 +460,8 @@ export default Plugin.define({
         button.style.setProperty("position", "relative")
         button.style.setProperty("z-index", "1")
         button.innerHTML = MIC_SVG
+        button.dataset.icon = MIC_SVG
+        button.dataset.recording = "0"
         button.addEventListener("click", (event) => {
           event.preventDefault()
           event.stopPropagation()
@@ -434,20 +473,43 @@ export default Plugin.define({
 
     const paintMicButtons = () => {
       const recording = phase() === "recording"
+      const icon = recording ? STOP_SVG : MIC_SVG
+      const label = recording ? ctx.t("whisper-mic.action.stop") : ctx.t("whisper-mic.action.start")
       for (const mic of Array.from(document.querySelectorAll<HTMLButtonElement>(MIC_SELECTOR))) {
-        mic.innerHTML = recording ? STOP_SVG : MIC_SVG
-        mic.style.setProperty("color", recording ? "#e5484d" : "")
-        mic.setAttribute("data-recording", recording ? "1" : "0")
-        const label = recording ? ctx.t("whisper-mic.action.stop") : ctx.t("whisper-mic.action.start")
-        mic.setAttribute("title", label)
-        mic.setAttribute("aria-label", label)
+        // Compare the source string held on the element, never mic.innerHTML:
+        // parsing then re-serialising an SVG rewrites self-closing tags and
+        // adds attribute quotes, so that comparison never settles and the write
+        // repeats forever — and each write is a childList mutation on the very
+        // subtree composerObserver watches, which wedges the renderer.
+        if (mic.dataset.icon !== icon) {
+          mic.dataset.icon = icon
+          mic.innerHTML = icon
+        }
+        const state = recording ? "1" : "0"
+        if (mic.dataset.recording !== state) {
+          mic.dataset.recording = state
+          // Set only on the transition: getPropertyValue("color") reads back as
+          // rgb(), so comparing it to a hex literal would never settle and every
+          // paint would dirty the style attribute other plugins observe.
+          mic.style.setProperty("color", recording ? "#e5484d" : "")
+        }
+        if (mic.title !== label) {
+          mic.title = label
+          mic.setAttribute("aria-label", label)
+        }
       }
     }
     createEffect(paintMicButtons)
 
+    let pendingSync = false
     const composerObserver = new MutationObserver(() => {
-      syncMicButton()
-      paintMicButtons()
+      if (pendingSync) return
+      pendingSync = true
+      queueMicrotask(() => {
+        pendingSync = false
+        syncMicButton()
+        paintMicButtons()
+      })
     })
     composerObserver.observe(document.body, { childList: true, subtree: true })
     const resync = setInterval(() => {
@@ -588,7 +650,7 @@ export default Plugin.define({
     const labelStyle = { display: "flex", "flex-direction": "column", gap: "6px" } as const
 
     const [copied, setCopied] = createSignal(false)
-    const [testState, setTestState] = createSignal<"idle" | "recording" | "running" | "ok">("idle")
+    const [testState, setTestState] = createSignal<"idle" | "recording" | "running" | "ok" | "empty">("idle")
     const [testResult, setTestResult] = createSignal("")
 
     const runTest = async () => {
@@ -617,13 +679,20 @@ export default Plugin.define({
         })
         setTestState("running")
         const text = await transcribeClip(wav)
-        setTestResult(text || ctx.t("whisper-mic.empty"))
-        setTestState("ok")
+        setTestResult(text)
+        setTestState(text ? "ok" : "empty")
       } catch (error) {
         setTestResult(errorText(error))
         setTestState("idle")
         ctx.toast.show({ title: ctx.t("whisper-mic.error"), description: errorText(error), variant: "error" })
       }
+    }
+
+    /** A configured path the scan did not find still has to be selectable and editable. */
+    const modelChoice = () => {
+      const list = modelList()
+      if (!list) return CUSTOM_MODEL
+      return list.models.some((model) => model.path === prefs().model) ? prefs().model : CUSTOM_MODEL
     }
 
     ctx.add(SettingsPage, {
@@ -666,7 +735,7 @@ export default Plugin.define({
               min="1"
               max="64"
               value={prefs().threads}
-              onInput={(event) => void savePrefs({ threads: Number(event.currentTarget.value) })}
+              onChange={(event) => void savePrefs({ threads: Number(event.currentTarget.value) })}
               style={fieldStyle}
             />
           </label>
@@ -681,15 +750,73 @@ export default Plugin.define({
             />
           </label>
 
-          <label style={labelStyle}>
+          <div style={labelStyle}>
             <span>{ctx.t("whisper-mic.settings.model")}</span>
-            <input
-              type="text"
-              value={prefs().model}
-              onChange={(event) => void savePrefs({ model: event.currentTarget.value })}
-              style={fieldStyle}
-            />
-          </label>
+            <Show
+              when={modelList()}
+              fallback={
+                <input
+                  type="text"
+                  value={prefs().model}
+                  onChange={(event) => void savePrefs({ model: event.currentTarget.value })}
+                  style={fieldStyle}
+                />
+              }
+            >
+              {(list) => (
+                <>
+                  <select
+                    value={modelChoice()}
+                    onChange={(event) => {
+                      const value = event.currentTarget.value
+                      if (value !== CUSTOM_MODEL) void savePrefs({ model: value })
+                    }}
+                    style={fieldStyle}
+                  >
+                    <Show when={list().models.length === 0}>
+                      <option value="">{ctx.t("whisper-mic.settings.model.none")}</option>
+                    </Show>
+                    <For each={list().models}>
+                      {(model) => (
+                        <option value={model.path}>
+                          {model.name} · {formatSize(model.bytes)}
+                        </option>
+                      )}
+                    </For>
+                    <Show when={modelChoice() === CUSTOM_MODEL}>
+                      <option value={CUSTOM_MODEL}>{ctx.t("whisper-mic.settings.model.custom")}</option>
+                    </Show>
+                  </select>
+                  <Show when={modelChoice() === CUSTOM_MODEL}>
+                    <input
+                      type="text"
+                      value={prefs().model}
+                      onChange={(event) => void savePrefs({ model: event.currentTarget.value })}
+                      style={fieldStyle}
+                    />
+                  </Show>
+                  <Show when={!list().configuredExists}>
+                    <span style={{ color: "#e5484d", "font-size": "12px" }}>
+                      {ctx.t("whisper-mic.settings.model.missing")}
+                    </span>
+                  </Show>
+                  <div style={{ display: "flex", gap: "8px", "align-items": "center", "font-size": "11px", opacity: 0.75 }}>
+                    <button
+                      type="button"
+                      style={{ padding: "2px 8px", "border-radius": "6px", cursor: "pointer" }}
+                      onClick={() => void refreshModels()}
+                    >
+                      {ctx.t("whisper-mic.settings.model.rescan")}
+                    </button>
+                    <span>
+                      {ctx.t("whisper-mic.settings.model.searched")}: <code>{list().dirs.join("  ")}</code>
+                    </span>
+                  </div>
+                  <span style={{ "font-size": "11px", opacity: 0.6 }}>{ctx.t("whisper-mic.settings.model.speed")}</span>
+                </>
+              )}
+            </Show>
+          </div>
 
           <label style={{ display: "flex", gap: "8px", "align-items": "center" }}>
             <input type="checkbox" checked={prefs().stripSilence} onChange={(event) => void savePrefs({ stripSilence: event.currentTarget.checked })} />
@@ -725,10 +852,14 @@ export default Plugin.define({
             >
               {testState() === "recording" || testState() === "running" ? ctx.t("whisper-mic.test.running") : ctx.t("whisper-mic.test")}
             </button>
-            <Show when={testState() === "ok"}>
-              <span style={{ color: "#2fb457", "font-weight": "600" }}>{ctx.t("whisper-mic.test.ok")}</span>
+            <Show when={testState() === "empty"} fallback={
+              <Show when={testState() === "ok"}>
+                <span style={{ color: "#2fb457", "font-weight": "600" }}>{ctx.t("whisper-mic.test.ok")}</span>
+              </Show>
+            }>
+              <span style={{ color: "#e5484d", "font-weight": "600" }}>{ctx.t("whisper-mic.test.silent")}</span>
             </Show>
-            <Show when={testResult()}>
+            <Show when={testState() !== "empty" && testResult()}>
               <span style={{ "font-family": "monospace", "font-size": "12px", opacity: 0.85 }}>{testResult()}</span>
             </Show>
           </div>

@@ -1,8 +1,12 @@
-import { describe, expect, it } from "vitest"
+import { mkdtemp, rm, writeFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import {
   bridgeHandler,
   commandHint,
   formatCommand,
+  listModels,
   stripSilenceHallucinations,
   whisperArgs,
   type BridgeRequest,
@@ -59,22 +63,42 @@ describe("bridgeHandler", () => {
 
 describe("whisperArgs", () => {
   it("carries the flags the settings page promises", () => {
-    const args = whisperArgs(SETTINGS, "/tmp/clip.wav", "/tmp/out", "ja")
+    const args = whisperArgs(SETTINGS, "/tmp/clip.wav", "/tmp/out", "en")
     expect(args).toEqual([
       "-m", "/m/ggml.bin",
       "-f", "/tmp/clip.wav",
-      "-l", "ja",
-      "-mfa",
+      "-l", "en",
+      "-t", "4",
       "-nt",
-      "-tp", "4",
+      "-np",
       "-otxt",
       "-of", "/tmp/out",
+    ])
+  })
+
+  it("biases Japanese towards kana and away from dropped particles", () => {
+    const args = whisperArgs(SETTINGS, "c.wav", "o", "ja")
+    expect(args.slice(args.indexOf("-l"))).toEqual([
+      "-l",
+      "ja",
+      "-t",
+      "4",
+      "-nt",
+      "-np",
+      "-sns",
+      "--prompt",
+      "技術的な内容を日本語で正しく書き起こします。",
+      "--carry-initial-prompt",
+      "-otxt",
+      "-of",
+      "o",
     ])
   })
 
   it("falls back to auto detection for an empty language", () => {
     const args = whisperArgs(SETTINGS, "c.wav", "o", "")
     expect(args).toContain("auto")
+    expect(args).not.toContain("--prompt")
   })
 })
 
@@ -83,7 +107,12 @@ describe("commandHint", () => {
     expect(formatCommand("/bin/a b", ["-f", "it's"])).toBe("'/bin/a b' '-f' 'it'\\''s'")
     const hint = commandHint(SETTINGS)
     expect(hint).toContain("'/home/u/.local/bin/whisper-cli'")
-    expect(hint).toContain("-mfa")
+    expect(hint).toContain("-of")
+  })
+
+  it("shows the Japanese flags when the language is Japanese", () => {
+    expect(commandHint(SETTINGS, "ja")).toContain("--prompt")
+    expect(commandHint(SETTINGS, "ja")).toContain("-sns")
   })
 })
 
@@ -97,5 +126,28 @@ describe("stripSilenceHallucinations", () => {
   it("keeps real speech intact", () => {
     expect(stripSilenceHallucinations("ビルドを走らせて")).toBe("ビルドを走らせて")
     expect(stripSilenceHallucinations("はい、ありがとう")).toBe("はい、ありがとう")
+  })
+})
+
+describe("listModels", () => {
+  let dir: string
+
+  beforeAll(async () => {
+    dir = await mkdtemp(join(tmpdir(), "oc-mic-models-"))
+    await writeFile(join(dir, "ggml-small.bin"), new Uint8Array(10))
+    await writeFile(join(dir, "ggml-medium.bin"), new Uint8Array(900))
+    await writeFile(join(dir, "notes.txt"), "not a model")
+  })
+
+  afterAll(() => void rm(dir, { recursive: true, force: true }))
+
+  it("returns ggml files only, best model first", async () => {
+    const found = await listModels([dir, join(dir, "does-not-exist")])
+    expect(found.map((model) => model.name)).toEqual(["ggml-medium.bin", "ggml-small.bin"])
+    expect(found[0]?.path).toBe(join(dir, "ggml-medium.bin"))
+  })
+
+  it("treats a missing directory as empty, not an error", async () => {
+    await expect(listModels([join(tmpdir(), "oc-mic-nope-42")])).resolves.toEqual([])
   })
 })

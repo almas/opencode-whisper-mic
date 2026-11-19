@@ -4,22 +4,33 @@
  * Audio comes from `MediaRecorder` in whatever container the browser prefers
  * (webm/opus on Chromium). Recorder chunks alone cannot be transcribed
  * incrementally — the encoder needs to close the stream to produce a
- * seekable file — so segments are cut on a fixed cadence: closing one
- * recorder gives a playable clip, a new recorder continues on the same mic
- * stream, and the gap between them is covered by capturing the live track too
- * (the first second or so of a fresh recorder can miss samples).
+ * seekable file — so clips are cut on a fixed cadence: closing one recorder
+ * gives a playable clip and a new recorder continues on the same mic stream.
  *
- * Whisper's per-clip output is a fresh interpretation, not a continuation:
+ * Consecutive clips are then overlapped in PCM before they are sent: each
+ * whisper window replays the tail of the previous one, so a word the cut
+ * landed in the middle of is still heard whole by exactly one window. Without
+ * that shared tail there is nothing to align successive transcriptions on.
+ *
+ * Whisper's per-window output is a fresh interpretation, not a continuation:
  * it may re-hear the same words with different particles, or restart from an
- * earlier sentence. The merge step keeps the longest stable prefix and only
- * appends what is genuinely new, so a correction landing later in a long
- * utterance does not rewrite or duplicate the beginning.
+ * earlier sentence. The merge step finds the overlap the two readings agree on
+ * and appends whatever the new window heard beyond it — which grows the caption
+ * even when whisper restarts mid-utterance, where a common-prefix rule dropped
+ * everything said before it (measured: 9–13% recall on real takes against 91%).
  */
 
 export const SAMPLE_RATE = 16000
 
-/** Clip length for streaming segments; whisper runs on each one as it fills. */
-export const SEGMENT_MS = 4000
+/** How often a recorder is closed to hand over a finished clip. */
+export const SEGMENT_MS = 3000
+
+/**
+ * Audio the next window replays from the previous clip. Whisper then hears a
+ * 4 s window every 3 s, so a word the cut fell inside is whole in one window
+ * and the two transcriptions have something to line up on.
+ */
+export const SEGMENT_OVERLAP_MS = 1000
 
 /** A short press is treated as a tap (send what was heard), not a dictation. */
 export const TAP_MAX_MS = 700
@@ -49,7 +60,7 @@ export function pickMimeType(): string {
  * channel present (not just taking the first) so a stereo clip keeps both
  * microphones and whisper reads the same signal a person hears.
  */
-export async function encodeWavFromBlob(blob: Blob): Promise<Blob> {
+export async function decodePcmFromBlob(blob: Blob): Promise<Int16Array> {
   const bytes = new Uint8Array(await blob.arrayBuffer())
   if (bytes.byteLength < 100) throw new Error("no audio was captured")
   const input = await new Promise<AudioBuffer>((resolve, reject) => {
@@ -88,6 +99,11 @@ export async function encodeWavFromBlob(blob: Blob): Promise<Blob> {
     }
   }
 
+  return pcm
+}
+
+/** Wrap 16 kHz mono PCM in the WAV header whisper.cpp reads. */
+export function wavFromPcm(pcm: Int16Array): Blob {
   const out = new DataView(new ArrayBuffer(44 + pcm.byteLength))
   const text = (offset: number, value: string) => {
     for (let i = 0; i < value.length; i++) out.setUint8(offset + i, value.charCodeAt(i))
@@ -106,6 +122,32 @@ export async function encodeWavFromBlob(blob: Blob): Promise<Blob> {
   out.setUint32(40, pcm.byteLength, true)
   new Uint8Array(out.buffer, 44).set(new Uint8Array(pcm.buffer))
   return new Blob([out.buffer], { type: "audio/wav" })
+}
+
+/** Decode a finished recording straight into a transcribable WAV. */
+export async function encodeWavFromBlob(blob: Blob): Promise<Blob> {
+  return wavFromPcm(await decodePcmFromBlob(blob))
+}
+
+/**
+ * Chain the clips of one take into overlapping whisper windows: every window
+ * is the previous one's tail plus whatever the new clip heard. The tail is
+ * taken from the window rather than the clip, so a rotation that yields short
+ * or empty clips still keeps the overlap intact for the next alignment.
+ */
+export function createOverlapWindower(overlapMs = SEGMENT_OVERLAP_MS) {
+  const carry = Math.max(0, Math.round((overlapMs * SAMPLE_RATE) / 1000))
+  let tail = new Int16Array(0)
+  return {
+    push: async (blob: Blob): Promise<Blob> => {
+      const pcm = await decodePcmFromBlob(blob)
+      const window = new Int16Array(tail.length + pcm.length)
+      window.set(tail)
+      window.set(pcm, tail.length)
+      tail = window.length > carry ? window.slice(window.length - carry) : window
+      return wavFromPcm(window)
+    },
+  }
 }
 
 const CJK = /[぀-ヿ一-龯぀-ゟ゠-ヿ]/
@@ -132,46 +174,56 @@ export function countWords(value: string): number {
   return cjk + latin
 }
 
+const tokens = (text: string) => text.trim().split(/\s+/).filter(Boolean)
+
+/** Ignore case and the punctuation whisper moves around when comparing tokens. */
+const comparable = (token: string) => token.toLowerCase().replace(/[、。，．\s,.!?"'()（）]/g, "")
+
+/** Offset in `text` just after its first `count` tokens. */
+function afterTokens(text: string, count: number): number {
+  const parts = [...text.matchAll(/\S+/g)]
+  return count >= parts.length ? text.length : parts[count]!.index
+}
+
+/** Longest run of tokens that ends `a` and starts `b`, capped at `max`. */
+function overlapLength(a: string[], b: string[], max: number): number {
+  for (let k = Math.min(max, a.length, b.length); k >= 1; k--) {
+    let shared = true
+    for (let i = 0; i < k; i++) {
+      if (comparable(a[a.length - k + i] ?? "") !== comparable(b[i] ?? "")) {
+        shared = false
+        break
+      }
+    }
+    if (shared) return k
+  }
+  return 0
+}
+
 /**
- * Fold a freshly transcribed segment into what has been heard so far.
+ * Fold a freshly transcribed window into what has been heard so far.
  *
- * The longest common prefix of old and new is stable history; anything after
- * it is the new segment's take on the shared tail plus its genuinely new
- * material. Keeping at most `tailWords` of that tail stops a clip that heard
- * the same sentence twice from doubling it, while still accepting a better
- * reading of the last few words (Whisper often hears the same phrase with
- * different particles at a segment boundary).
+ * Windows overlap by a second of audio, so their transcriptions overlap by
+ * however much was said in it. The longest token run that ends the caption and
+ * starts the new text is that shared part; the new window contributes only what
+ * it heard beyond it. The shared part keeps the wording already on screen —
+ * re-reading it with the newer version looked appealing and measured as a wash
+ * on real clips, while it visibly rewrites text the user has already read.
+ *
+ * When nothing lines up the new window is appended as-is rather than dropped:
+ * a window that starts mid-sentence is common, and losing a second of real
+ * speech costs more than the occasional repeated phrase. Character-level
+ * alignment was tried for Japanese, where whitespace gives nothing to line up
+ * on; it trimmed real speech along with the duplicates and scored lower.
  */
-export function mergeTranscription(existing: string, incoming: string, tailWords = 6): string {
+export function mergeTranscription(existing: string, incoming: string, maxOverlap = 12): string {
   const left = existing.trim()
   const right = incoming.trim()
   if (!right) return left
   if (!left) return right
 
-  const a = left.split(/(\s+)/)
-  const b = right.split(/(\s+)/)
-  let common = 0
-  while (common < a.length && common < b.length) {
-    const wa = a[common]!.replace(/\s+/g, "")
-    const wb = b[common]!.replace(/\s+/g, "")
-    if (wa !== wb) break
-    common++
-  }
-
-  // No shared prefix: the new clip started somewhere else entirely. Without
-  // any overlap to align on, appending a second interpretation of the same
-  // speech would duplicate it — better to trust the fresh segment.
-  if (common === 0) return right
-
-  const rest = b
-    .slice(common)
-    .join("")
-    .trim()
-    .split(/\s+/)
-    .filter(Boolean)
-  if (rest.length === 0) return left
-  const tail = rest.slice(Math.max(0, rest.length - tailWords)).join(" ")
-  return joinFragments(left, tail)
+  const tail = right.slice(afterTokens(right, overlapLength(tokens(left), tokens(right), maxOverlap))).trimStart()
+  return tail ? joinFragments(left, tail) : left
 }
 
 /** Is this a short acknowledgement the user likely wants run right away? */

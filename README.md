@@ -9,8 +9,8 @@ You talk, the caption grows while you talk: short WAV clips are streamed to a lo
 ## Features
 
 - **Streams while you speak** — the mic is captured in rotating 4-second clips (with a small overlap so words at the seams survive); each clip is transcribed as soon as it is uploaded and folded into the live caption by longest-common-prefix merge.
-- **Three ways to start**: a mic button next to the composer send button, a mic button in the session header, and a command palette entry (default keybind `Ctrl/Cmd+Shift+M`). Click again (or the shortcut) to stop; a tap shorter than 0.7 s is ignored so accidental clicks do not cancel dictation.
-- **Local whisper.cpp**: the plugin's server half runs a tiny HTTP bridge on `http://whisper-mic.localhost:2026` and invokes your `whisper-cli` with the model, language and thread count you set in the settings page. The exact command line is shown there verbatim, and a one-tap **Test** records 3 seconds through the full pipeline so you can hear/see the result immediately.
+- **Three ways to start**: a mic button next to the composer send button, a mic button in the session header, and a command palette entry (default keybind `Ctrl/Cmd+Shift+D`). Click again (or the shortcut) to stop; a tap shorter than 0.7 s is ignored so accidental clicks do not cancel dictation.
+- **Local whisper.cpp**: the plugin's server half runs a tiny HTTP bridge on `http://whisper-mic.localhost:2026` and invokes your `whisper-cli` with the model, language and thread count you set in the settings page — where *Model* is a picker of the `ggml*.bin` files already on your machine. The exact command line is shown there verbatim, and a one-tap **Test** records 3 seconds through the full pipeline so you can hear/see the result immediately.
 - **Sanitised output**: silence-hallucination boilerplate (「ご視聴ありがとうございました」, `[Applause]`, 【音楽】 …) is stripped before it ever reaches the caption.
 - **Language-aware merge**: CJK text is joined without spaces; latin words keep theirs.
 
@@ -32,11 +32,11 @@ You talk, the caption grows while you talk: short WAV clips are streamed to a lo
 }
 ```
 
-Reload the window, open **Settings → Whisper Mic**, point *Binary* and *Model* at your whisper.cpp build, press **Test**, and dictation is live.
+Reload the window, open **Settings → Whisper Mic**, point *Binary* at your whisper.cpp build and pick a *Model* — the list is built by scanning `~/.local/share/whisper-models`, `~/.cache/whisper`, `~/models` and `/usr/local/share/whisper-models`, with **Other path…** for a model stored elsewhere. Press **Test**, and dictation is live.
 
 ## Usage
 
-1. Focus the composer (or just press `Ctrl/Cmd+Shift+M`).
+1. Focus the composer (or just press `Ctrl/Cmd+Shift+D`).
 2. Speak. The caption under the header grows as whisper answers each clip.
 3. Click the mic again to stop. The final merged text lands in the composer, ready to edit and send.
 
@@ -73,8 +73,9 @@ Layout:
 OpenCode Desktop で使える、ローカル whisper.cpp による音声入力（ディクテーション）プラグインです。
 
 - 話している最前から文字起こしが画面に育ちます: 4 秒ごとの音声クリップを順にブリッジへ送り、結果を接頭辞マッチで結合します。
-- 起動は composer のマイク、ヘッダーのマイク、`Ctrl/Cmd+Shift+M`（コマンドパレット）の三経路。もう一度押すと停止します。
+- 起動は composer のマイク、ヘッダーのマイク、`Ctrl/Cmd+Shift+D`（コマンドパレット）の三経路。もう一度押すと停止します。
 - 設定ページに whisper-cli の実行コマンドをそのまま表示、ワンタップの 3 秒テストで全経路を確認できます。
+- モデルは、このマシンにある `ggml*.bin`（`~/.local/share/whisper-models` など）を検出して一覧から選びます。別の場所のファイルは「その他のパス…」で直接指定します。
 - 無音で湧くハルシネーション（「ご視聴ありがとうございました」等）は除去してから表示します。
 
 whisper.cpp のビルド（`whisper-cli` と GGUF モデル）が必要です。`~/.config/opencode/opencode.jsonc` の `plugins` に登録し、ウィンドウを再読み込みしてください。

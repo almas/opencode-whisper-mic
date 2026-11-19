@@ -41,15 +41,31 @@ describe("mergeTranscription", () => {
   })
 
   it("accepts a better reading of the shared tail", () => {
-    // Whisper often re-hears the last words with different particles.
+    // Whisper often re-hears the last words with different particles; the part
+    // past the overlap is what gets added.
     const merged = mergeTranscription("turn left at the corner", "turn left at the corner then stop")
     expect(merged).toBe("turn left at the corner then stop")
   })
 
-  it("replaces wholesale when there is no shared prefix", () => {
+  it("lines the windows up through punctuation and case", () => {
+    expect(mergeTranscription("Build the thing.", "THING and run it")).toBe("Build the thing. and run it")
+  })
+
+  it("appends the new window when nothing lines up, instead of losing it", () => {
+    // The cut landed mid-sentence, so there is no shared tail to align on; the
+    // older caption already holds real speech and must survive.
     expect(mergeTranscription("hello there friend", "completely different start")).toBe(
-      "completely different start",
+      "hello there friend completely different start",
     )
+  })
+
+  it("joins Japanese windows without inventing spaces", () => {
+    expect(mergeTranscription("こんにちは 世界", "世界 です")).toBe("こんにちは 世界です")
+    expect(mergeTranscription("ビルドを", "走らせて")).toBe("ビルドを走らせて")
+  })
+
+  it("only aligns overlaps up to the budget", () => {
+    expect(mergeTranscription("a b c d", "c d e", 1)).toBe("a b c d c d e")
   })
 
   it("keeps the older text when the fresh clip adds nothing", () => {
